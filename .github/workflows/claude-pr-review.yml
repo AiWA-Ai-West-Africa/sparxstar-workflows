@@ -1,8 +1,6 @@
 name: Claude PR Review
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
   workflow_call:
     secrets:
       ANTHROPIC_API_KEY:
