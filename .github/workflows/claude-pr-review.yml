@@ -1,0 +1,173 @@
+name: Claude PR Review
+
+on:
+  workflow_call:
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+
+jobs:
+  review:
+    name: Claude Code Review
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get PR diff
+        id: diff
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Fetch the full diff for this PR
+          gh pr diff ${{ github.event.pull_request.number }} > pr.diff
+
+          # Truncate if over 80KB to stay within API limits
+          if [ $(wc -c < pr.diff) -gt 80000 ]; then
+            head -c 80000 pr.diff > pr_truncated.diff
+            mv pr_truncated.diff pr.diff
+            echo "truncated=true" >> $GITHUB_OUTPUT
+          else
+            echo "truncated=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Load spec context
+        id: specs
+        run: |
+          # Collect AGENTS.md or copilot instructions if present
+          SPEC_CONTEXT=""
+
+          if [ -f "AGENTS.md" ]; then
+            SPEC_CONTEXT="${SPEC_CONTEXT}$(cat AGENTS.md)\n\n"
+          fi
+
+          if [ -f ".github/copilot-instructions.md" ]; then
+            SPEC_CONTEXT="${SPEC_CONTEXT}$(cat .github/copilot-instructions.md)\n\n"
+          fi
+
+          # Collect any spec/doc markdown files in root or docs/
+          shopt -s nullglob
+          for f in *.md docs/*.md specs/*.md; do
+            if [ -f "$f" ] && [ "$f" != "README.md" ] && [ "$f" != "CHANGELOG.md" ]; then
+              SPEC_CONTEXT="${SPEC_CONTEXT}--- FILE: $f ---\n$(cat $f)\n\n"
+            fi
+          done
+          shopt -u nullglob
+
+          # Write to file to avoid env size limits
+          printf "%b" "$SPEC_CONTEXT" > spec_context.txt
+
+      - name: Run Claude review
+        id: claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # Fail fast if the API key is not set
+          if [ -z "${ANTHROPIC_API_KEY}" ]; then
+            echo "ERROR: ANTHROPIC_API_KEY secret is not set." >&2
+            exit 1
+          fi
+
+          DIFF=$(cat pr.diff)
+          SPECS=$(cat spec_context.txt)
+          REPO="${{ github.repository }}"
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          TRUNCATED="${{ steps.diff.outputs.truncated }}"
+
+          # Build the review request
+          cat > request.json << REQEOF
+          {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 4096,
+            "messages": [
+              {
+                "role": "user",
+                "content": $(jq -Rs . << CONTENTEOF
+You are a senior code reviewer for the SPARXSTAR platform built by Starisian Technologies. You review pull requests against platform specs and architectural standards.
+
+REPOSITORY: ${REPO}
+PR #${PR_NUMBER}: ${PR_TITLE}
+$([ "$TRUNCATED" = "true" ] && echo "NOTE: Diff truncated to 80KB. Review covers the first portion only.")
+
+PLATFORM CONTEXT AND SPECS:
+${SPECS}
+
+PLATFORM-WIDE RULES (apply to every repo):
+- declare(strict_types=1) in every PHP file
+- No error_log() — use platform logging pattern
+- No SELECT * in any query
+- No MIT license in proprietary repos — must be proprietary
+- No wordpress/mcp-adapter — this package does not exist
+- No local redefinition of any type owned by sparxstar-ouroboros-integrity
+- No packages/ stub directories — the real package is published
+- No test files, no stub files, no mock files unless explicitly requested
+- GovernanceTokenSigningMaterial::build() not canonicalize()
+- ContextPulse signing field order: pulse_id|context_id|device_id|session_id|site_id|network_id|trust_score_4dp|trust_level|behavior_flags_json|geo_zone|network_effective_type|session_duration|issued_at|expires
+- CI auth step must have fail-fast guard on empty token
+- AuditLedger genesis hash must be str_repeat('0', 64) not empty string
+- SieveKernel boot() must call did_action('muplugins_loaded') before deferring
+- GovernanceToken TTL must enforce Platform::GOVERNANCE_TOKEN_TTL_MIN_SECONDS floor
+- AES-256-GCM not CBC for authenticated encryption
+- No identity_id in ContextPulse (replay attack surface)
+- behavior_flags serialized as sorted JSON array not CSV
+
+REVIEW THE FOLLOWING DIFF:
+${DIFF}
+
+Produce a focused review in this format:
+
+REPOSITORY: [name]
+PR: [number and title]
+
+VIOLATIONS (must fix before merge):
+[SEVERITY] Description. Rule: [reference].
+
+WARNINGS (should fix):
+[SEVERITY] Description.
+
+VERDICT: PASS / FAIL / CONDITIONAL
+
+Be specific. Reference actual line content from the diff. Skip mechanical issues that linters catch unless they are security-critical. Focus on architectural violations, spec drift, security incidents, and boundary crossings.
+CONTENTEOF
+                )
+              }
+            ]
+          }
+REQEOF
+
+          # Call the API
+          RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: ${ANTHROPIC_API_KEY}" \
+            -H "anthropic-version: 2023-06-01" \
+            -d @request.json)
+
+          # Extract the review text
+          REVIEW=$(echo "$RESPONSE" | jq -r '.content[0].text // "Review failed: " + (.error.message // "unknown error")')
+
+          # Write to file for next step
+          echo "$REVIEW" > review.txt
+
+      - name: Post review comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REVIEW=$(cat review.txt)
+          TRUNCATION_NOTE=""
+
+          if [ "${{ steps.diff.outputs.truncated }}" = "true" ]; then
+            TRUNCATION_NOTE="> ⚠️ **Diff truncated** — PR exceeds 80KB. Review covers the first portion only. Large PRs should be split."$'\n\n'
+          fi
+
+          # Build comment body
+          COMMENT="## Claude PR Review"$'\n\n'"${TRUNCATION_NOTE}${REVIEW}"$'\n\n'"---"$'\n'"*Reviewed by Claude claude-sonnet-4-20250514 · [SPARXSTAR Platform Standards](https://github.com/Starisian-Technologies)*"
+
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --body "$COMMENT"
